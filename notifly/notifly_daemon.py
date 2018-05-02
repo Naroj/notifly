@@ -7,9 +7,11 @@ import logging
 import argparse
 import collections
 import time
+import random
 import multiprocessing as mp
 
 import requests
+import yaml
 import dns.flags
 import dns.name
 import dns.query
@@ -35,8 +37,9 @@ class EventReceiver(mp.Process):
 
     daemon = True
 
-    def __init__(self, remote_api, remote_api_key):
+    def __init__(self, remote_api, remote_api_key, config):
         super(EventReceiver, self).__init__()
+        self.config = config
         self.remote_api = remote_api
         self.remote_api_key = remote_api_key
 
@@ -58,12 +61,34 @@ class EventReceiver(mp.Process):
         if not 'masters' in json_data:
             logging.error("domain {} has no configured masters")
             return None
-        if source_ip in json_data['masters']:
-            logging.info("sender is known master")
-            return True
+        """
+        #TODO: make edns client-subnet work in order to know if the client is authorized to initiate an action
+        # elif source_ip in json_data['masters']:
+        #    logging.info("sender is known master")
         else:
             logging.info("sender ({}) is not master".format(source_ip))
             return False
+        """
+
+    def invoke_endpoints(self):
+        """
+        """
+        logging.info("invoking: {}".format(self.config['endpoints']))
+        pass
+
+    def event_handler(self, event):
+        """
+        handle an incoming event
+        """
+        if PARAMS.check_master:
+            sender_is_master = self.check_masters(source_ip=event[0], domain=event[1])
+            if sender_is_master:
+                self.perform_rectify(domain=event[1])
+        else:
+            logging.info('no master check')
+            self.perform_rectify(domain=event[1])
+        if self.config and 'endpoints' in self.config.keys():
+            self.invoke_endpoints()
 
     def run(self):
         """
@@ -71,13 +96,11 @@ class EventReceiver(mp.Process):
         consumer will drop events in our queue
         """
         while True:
-            time.sleep(3)
+            time.sleep(random.choice((2,4,1)))
             qsize = EVENT_QUEUE.qsize()
             for num in range(0, qsize):
-                item = EVENT_QUEUE.get()
-                sender_is_master = self.check_masters(source_ip=item[0], domain=item[1])
-                if sender_is_master:
-                    self.perform_rectify(domain=item[1])
+                event = EVENT_QUEUE.get()
+                self.event_handler(event)
             logging.info('{} has naptime'.format(os.getpid()))
 
 
@@ -89,9 +112,6 @@ class AsyncUDP(asyncio.DatagramProtocol):
     relevant elements in a queue
     event listener classes will take notice and perform content-level operations
     """
-
-    #def __init__(self):
-    #    super(AsyncUDP, self).__init__()
 
     def connection_made(self, transport):
         self.transport = transport
@@ -145,6 +165,9 @@ class AsyncUDP(asyncio.DatagramProtocol):
         if request is None:
             return()
         if request.opcode_text == 'NOTIFY':
+            logging.info(dir(request.request))
+            for opt in request.request.options:
+                logging.info(opt.data)
             if request.origin[-1] == '.':
                 EVENT_QUEUE.put((source_ip, request.origin[:-1]))
             else:
@@ -221,6 +244,19 @@ def parameter_parser():
         default="api_Iu2ooyuoSee5zeihee5doeNgohPhir0f",
         help='remote authoritive PowerDNS API key'
     )
+    parser.add_argument(
+        '--conf',
+        required=False,
+        default=None,
+        help='parse config for endpoint invocation'
+    )
+    parser.add_argument(
+        '--check-master',
+        action='store_true',
+        required=False,
+        default=False,
+        help='Check if notify sender is a known master (depends on PowerDNS API)'
+    )
     parsed_args = parser.parse_args(sys.argv[1:])
     return parsed_args
 
@@ -260,6 +296,15 @@ def proc_manager(**kwargs):
             new_instance.start()
             runtime.append(tuple((proc_name, new_instance)))
 
+def load_config(config):
+    """
+    Load config file (primarily for endpoints)
+    # TODO: sanity checks on config content
+    """
+    with open(config, 'r') as fp:
+        content = yaml.load(fp.read())
+    return(content)
+
 if __name__ == '__main__':
     """
     Get settings from CLI arguments
@@ -269,6 +314,10 @@ if __name__ == '__main__':
     logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
     EVENT_QUEUE = mp.Queue()
     PARAMS = parameter_parser()
+    if PARAMS.conf:
+        config = load_config(PARAMS.conf)
+    else:
+        config = None
     NS_CLASSES = {
         'udp' : UDPListener
     }
@@ -279,23 +328,23 @@ if __name__ == '__main__':
     NS_RUNTIME = []
     EVENT_CLASSES = {
         'recv0' : EventReceiver,
-        'recv1' : EventReceiver,
-        'recv2' : EventReceiver
+        'recv1' : EventReceiver
     }
     EVENT_PROPERTIES = {
         'remote_api' : PARAMS.remote_api,
-        'remote_api_key' : PARAMS.remote_api_key
+        'remote_api_key' : PARAMS.remote_api_key,
+        'config' : config
     }
     EVENT_RUNTIME = []
     while True:
         time.sleep(1)
         proc_manager(**{
-            'classes'   : NS_CLASSES,
+            'classes' : NS_CLASSES,
             'properties': NS_PROPERTIES,
-            'runtime'   : NS_RUNTIME
+            'runtime' : NS_RUNTIME
         })
-        proc_manager(
-            classes=EVENT_CLASSES,
-            properties=EVENT_PROPERTIES,
-            runtime=EVENT_RUNTIME
-        )
+        proc_manager(**{
+            'classes' : EVENT_CLASSES,
+            'properties' : EVENT_PROPERTIES,
+            'runtime' : EVENT_RUNTIME
+        })
