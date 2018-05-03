@@ -8,7 +8,10 @@ import argparse
 import collections
 import time
 import random
+import threading as td
 import multiprocessing as mp
+import pprint
+import json
 
 import requests
 import yaml
@@ -23,16 +26,133 @@ import dns.rdataclass
 import dns.resolver
 
 """
-Asynchronous TCP/UDP DNS service python
-Listens for DNS notifications and returns AXFR fetched content as JSON object
+Asynchronous TCP/UDP DNS service
+Listens for DNS notifications and calls backend as configured
 (c) jfranx@kernelbug.org
 """
+
+class Event(td.Thread):
+
+    """
+    Handle a single event non-blocking
+    """
+
+    def __init__(self, **kwargs):
+        super(Event, self).__init__()
+        self.config = kwargs['config']
+        self.remote_api = kwargs['remote_api']
+        self.remote_api_key = kwargs['remote_api_key']
+        self.domain = kwargs['domain']
+
+    def run(self):
+        time.sleep(random.choice((1, 2, 3)))
+        self.get_zone_content()
+        #self.invoke_endpoints()
+
+    def filter_axfr(self, axfr_query):
+        """
+        Take AXFR query output and perform filtering on content 
+        """
+        filtered_rrsets = []
+        ignore_types = (
+            'RRSIG',
+            'DNSKEY',
+            'RP',
+            'NSEC',
+            'NSEC3PARAM',
+            'NSEC3'
+        )
+        for message in axfr_query:
+            for rrset in message.answer:
+                rdatatype = dns.rdatatype.to_text(rrset.rdtype)
+                if not rdatatype in ignore_types:
+                    filtered_rrsets.append(rrset)
+        for rrset in filtered_rrsets:
+            rdatatype = dns.rdatatype.to_text(rrset.rdtype)
+            domain_name_object = dns.name.Name(self.domain.split('.'))
+            rrset_name = rrset.name.derelativize(origin=domain_name_object)
+            new_set = {
+                'name' : rrset_name.to_text(),
+                'type' : rdatatype,
+                'ttl' : rrset.ttl,
+                'records' : []
+            }
+            for rdata in rrset.items:
+                content = " ".join(rdata.to_text().split())
+                new_set['records'].append({"content" : str(rdata.to_text())})
+            logging.info("set dump: {}".format(json.dumps(new_set)))
+            # TODO: continue to work from here
+            
+
+    def get_zone_content(self):
+        """
+        Get content from zone via AXFR
+        Stop after first successful action, we only need the results once
+        """
+        for master in self.masters:
+            logging.info("working on master: " + master)
+            req = dns.query.xfr(master, self.domain)
+            self.filter_axfr(req)
+            break
+
+    @property
+    def masters(self):
+        """
+        Fetch masters from an authoritative server
+        The pdns endpoint is expected to wrap an endpoint which exposes domain masters
+        #TODO: make this non-powerdns specific
+        """
+        try:
+            base_url = self.config['endpoints']['pdns']['url']
+            url = "{}/get_masters/{}".format(base_url, self.domain)
+        except KeyError:
+            return []
+        try:
+            headers = {}
+            for header in self.config['endpoints']['pdns']['headers']:
+                headers.update(header)
+        except KeyError:
+            headers = {}
+        try:
+            req = requests.get(url, headers=headers)
+            json_data = req.json()
+        except Exception as api_call_error: 
+            logging.error("error {} while fetching masters from {}"\
+            .format(api_call_error, self.domain))
+            return []
+        if json_data:
+            logging.info("masters found for {} ({})".format(self.domain, json_data))
+            return json_data
+        else:
+            return []
+            logging.info("no masters")
+
+    def invoke_endpoints(self):
+        """
+        Invoke endpoints from configuration
+        """
+        for name, conf  in self.config['endpoints'].items():
+            logging.info("invoking endpoint: {}".format(name))
+            try:
+                url = conf['url']
+            except KeyError:
+                logging.error("endpoint without url")
+                continue
+            try:
+                headers = {}
+                for header in conf['headers']:
+                    headers.update(header)
+            except KeyError:
+                headers = {}
+            req = requests.put(url, headers=headers, data={'qq' : 'ee'})
+            json_data = req.json()
+            logging.info(json_data)
+
 
 class EventReceiver(mp.Process):
 
     """
-    Receive events, send them to shared memory space
-    The EventRouter will get take over from there
+    Receive events and initiate and 'Event'
     """
 
     daemon = True
@@ -43,64 +163,24 @@ class EventReceiver(mp.Process):
         self.remote_api = remote_api
         self.remote_api_key = remote_api_key
 
-    def perform_rectify(self, domain):
-        url = "{}/api/v1/servers/localhost/zones/{}/rectify".format(self.remote_api, domain)
-        headers = {'X-API-Key' : self.remote_api_key}
-        payload = {'server_id':'localhost', 'zone_id' : domain}
-        req = requests.put(url, headers=headers, data=payload)
-        logging.info(str(req))
-
-    def check_masters(self, source_ip, domain):
-        """
-        check if notify sender is configured as a master
-        """
-        url = "{}/api/v1/servers/localhost/zones/{}".format(self.remote_api, domain)
-        headers = {'X-API-Key' : self.remote_api_key}       
-        req = requests.get(url, headers=headers)    
-        json_data = req.json()
-        if not 'masters' in json_data:
-            logging.error("domain {} has no configured masters")
-            return None
-        """
-        #TODO: make edns client-subnet work in order to know if the client is authorized to initiate an action
-        # elif source_ip in json_data['masters']:
-        #    logging.info("sender is known master")
-        else:
-            logging.info("sender ({}) is not master".format(source_ip))
-            return False
-        """
-
-    def invoke_endpoints(self):
-        """
-        """
-        logging.info("invoking: {}".format(self.config['endpoints']))
-        pass
-
-    def event_handler(self, event):
-        """
-        handle an incoming event
-        """
-        if PARAMS.check_master:
-            sender_is_master = self.check_masters(source_ip=event[0], domain=event[1])
-            if sender_is_master:
-                self.perform_rectify(domain=event[1])
-        else:
-            logging.info('no master check')
-            self.perform_rectify(domain=event[1])
-        if self.config and 'endpoints' in self.config.keys():
-            self.invoke_endpoints()
-
     def run(self):
         """
         run a daemonized consumer
         consumer will drop events in our queue
         """
         while True:
-            time.sleep(random.choice((2,4,1)))
+            time.sleep(random.choice((2, 1)))
             qsize = EVENT_QUEUE.qsize()
             for num in range(0, qsize):
                 event = EVENT_QUEUE.get()
-                self.event_handler(event)
+                event_thread = Event(
+                    remote_api=self.remote_api,
+                    remote_api_key=self.remote_api_key,
+                    config=self.config,
+                    domain=event[1]
+                )
+                event_thread.start()
+                #self.event_handler(event)
             logging.info('{} has naptime'.format(os.getpid()))
 
 
@@ -303,7 +383,7 @@ def load_config(config):
     """
     with open(config, 'r') as fp:
         content = yaml.load(fp.read())
-    return(content)
+    return content
 
 if __name__ == '__main__':
     """
@@ -315,9 +395,9 @@ if __name__ == '__main__':
     EVENT_QUEUE = mp.Queue()
     PARAMS = parameter_parser()
     if PARAMS.conf:
-        config = load_config(PARAMS.conf)
+        CONFIG = load_config(PARAMS.conf)
     else:
-        config = None
+        CONFIG = None
     NS_CLASSES = {
         'udp' : UDPListener
     }
@@ -333,7 +413,7 @@ if __name__ == '__main__':
     EVENT_PROPERTIES = {
         'remote_api' : PARAMS.remote_api,
         'remote_api_key' : PARAMS.remote_api_key,
-        'config' : config
+        'config' : CONFIG
     }
     EVENT_RUNTIME = []
     while True:
