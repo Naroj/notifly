@@ -1,0 +1,23 @@
+--- 
+# Collection of endpoints
+endpoints: 
+  pdns:
+    headers:
+      - check_masters: "true"
+      - remote_api: "http://pdns-server.example.io:8081"
+      - remote_api_key: "pdns_api_secret_key"
+    url: "http://127.0.0.1:1026"
+  #mailer: 
+  #  headers: 
+  #    - from_email: "corn@soup.nl"
+  #    - to_email: "bucket+mr_miracle@kernelbug.org"
+  #    - subject: "zone update"
+  #  url: "http://127.0.0.1:1025"
+
+general: 
+  check_masters: true
+
+net: 
+  accept_from: "trusted-source.example.io,dnsdist1.example.nl,dnsdist2.example.nl"
+  local_ip: "0.0.0.0"
+  local_port: 5300
