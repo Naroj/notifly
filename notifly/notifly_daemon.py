@@ -356,17 +356,17 @@ def load_config(config):
     fail = False
     with open(config, 'r') as fp:
         content = yaml.load(fp.read())
-     if not 'endpoints' in content.keys():
-         return
-     for title, items in content['endpoints'].items():
-         if not 'url' in items.keys():
-             fail = True
-             logging.error("no url found in endpoint '{}'".format(title))
-         if not items['url'].startswith('http'):
-             fail = True
-             logging.error("non HTTP(S) url found in endoint '{}'".format(title))
-         if not items['url'].startswith('https'):
-             logging.warning("non SSL url found in endoint '{}'".format(title))
+    if not 'endpoints' in content.keys():
+        return
+    for title, items in content['endpoints'].items():
+        if not 'url' in items.keys():
+            fail = True
+            logging.error("no url found in endpoint '{}'".format(title))
+        if not items['url'].startswith('http'):
+            fail = True
+            logging.error("non HTTP(S) url found in endoint '{}'".format(title))
+        if not items['url'].startswith('https'):
+            logging.warning("non SSL url found in endoint '{}'".format(title))
     if fail:
         logging.info("stopping execution due to blocking config issues")
         sys.exit(1)
