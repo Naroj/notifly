@@ -40,8 +40,6 @@ class Event(td.Thread):
     def __init__(self, **kwargs):
         super(Event, self).__init__()
         self.config = kwargs['config']
-        self.remote_api = kwargs['remote_api']
-        self.remote_api_key = kwargs['remote_api_key']
         self.domain = kwargs['domain']
 
     def run(self):
@@ -100,7 +98,6 @@ class Event(td.Thread):
         """
         Fetch masters from an authoritative server
         The pdns endpoint is expected to wrap an endpoint which exposes domain masters
-        #TODO: make this non-powerdns specific
         """
         try:
             base_url = self.config['endpoints']['pdns']['url']
@@ -123,9 +120,7 @@ class Event(td.Thread):
         if json_data:
             logging.info("masters found for {} ({})".format(self.domain, json_data))
             return json_data
-        else:
-            return []
-            logging.info("no masters")
+        return []
 
     def invoke_endpoints(self):
         """
@@ -144,7 +139,7 @@ class Event(td.Thread):
                     headers.update(header)
             except KeyError:
                 headers = {}
-            req = requests.put(url, headers=headers, data={'qq' : 'ee'})
+            req = requests.put(url, headers=headers, data={'domain' : self.domain})
             json_data = req.json()
             logging.info(json_data)
 
@@ -152,16 +147,14 @@ class Event(td.Thread):
 class EventReceiver(mp.Process):
 
     """
-    Receive events and initiate and 'Event'
+    Receive events and initiate an 'Event' class
     """
 
     daemon = True
 
-    def __init__(self, remote_api, remote_api_key, config):
+    def __init__(self, config):
         super(EventReceiver, self).__init__()
         self.config = config
-        self.remote_api = remote_api
-        self.remote_api_key = remote_api_key
 
     def run(self):
         """
@@ -174,8 +167,6 @@ class EventReceiver(mp.Process):
             for num in range(0, qsize):
                 event = EVENT_QUEUE.get()
                 event_thread = Event(
-                    remote_api=self.remote_api,
-                    remote_api_key=self.remote_api_key,
                     config=self.config,
                     domain=event[1]
                 )
@@ -260,6 +251,7 @@ class AsyncUDP(asyncio.DatagramProtocol):
             except Exception as health_err:
                 logging.info("health-check error: {}".format(health_err))
 
+
 class UDPListener(mp.Process):
 
     """
@@ -303,39 +295,20 @@ def parameter_parser():
     parser.add_argument(
         '--local-ip',
         required=False,
-        default='0.0.0.0',
+        default='127.0.0.1',
         help='IP address to listen on'
     )
     parser.add_argument(
         '--local-port',
         required=False,
-        default=53,
+        default=0,
         help='Port on which we receive DNS notifications (RFC1996)'
-    )
-    parser.add_argument(
-        '--remote-api',
-        required=False,
-        default="http://185.3.211.53:8081",
-        help='remote authoritive PowerDNS API'
-    )
-    parser.add_argument(
-        '--remote-api-key',
-        required=False,
-        default="api_Iu2ooyuoSee5zeihee5doeNgohPhir0f",
-        help='remote authoritive PowerDNS API key'
     )
     parser.add_argument(
         '--conf',
         required=False,
         default=None,
         help='parse config for endpoint invocation'
-    )
-    parser.add_argument(
-        '--check-master',
-        action='store_true',
-        required=False,
-        default=False,
-        help='Check if notify sender is a known master (depends on PowerDNS API)'
     )
     parsed_args = parser.parse_args(sys.argv[1:])
     return parsed_args
@@ -379,10 +352,24 @@ def proc_manager(**kwargs):
 def load_config(config):
     """
     Load config file (primarily for endpoints)
-    # TODO: sanity checks on config content
     """
+    fail = False
     with open(config, 'r') as fp:
         content = yaml.load(fp.read())
+     if not 'endpoints' in content.keys():
+         return
+     for title, items in content['endpoints'].items():
+         if not 'url' in items.keys():
+             fail = True
+             logging.error("no url found in endpoint '{}'".format(title))
+         if not items['url'].startswith('http'):
+             fail = True
+             logging.error("non HTTP(S) url found in endoint '{}'".format(title))
+         if not items['url'].startswith('https'):
+             logging.warning("non SSL url found in endoint '{}'".format(title))
+    if fail:
+        logging.info("stopping execution due to blocking config issues")
+        sys.exit(1)
     return content
 
 if __name__ == '__main__':
@@ -411,8 +398,6 @@ if __name__ == '__main__':
         'recv1' : EventReceiver
     }
     EVENT_PROPERTIES = {
-        'remote_api' : PARAMS.remote_api,
-        'remote_api_key' : PARAMS.remote_api_key,
         'config' : CONFIG
     }
     EVENT_RUNTIME = []
