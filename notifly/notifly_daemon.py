@@ -63,7 +63,8 @@ class Event(td.Thread):
                     headers.update(header)
             except KeyError:
                 headers = {}
-            req = requests.put(url, headers=headers, data={'domain' : self.domain})
+            payload = json.dumps({'domain' : self.domain})
+            req = requests.put(url, headers=headers, data=payload)
             json_data = req.json()
             logging.info(json_data)
 
