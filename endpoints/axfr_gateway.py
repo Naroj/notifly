@@ -94,7 +94,7 @@ def serial_query(domain, masters):
 
 @axfr_gw_app.route('/', methods=['PUT'])
 def accept_notification():
-    content = request.data
+    content = request.get_json()
     logging.info(content)
     return jsonify({'msg' : 'gracias amigo!'})
 
