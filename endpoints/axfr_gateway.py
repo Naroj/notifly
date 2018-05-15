@@ -96,6 +96,7 @@ def serial_query(domain, masters):
 def accept_notification():
     content = request.get_json()
     logging.info(content)
+    return jsonify({'msg' : 'gracias amigo!'})
 
 if __name__ == '__main__':
     logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
