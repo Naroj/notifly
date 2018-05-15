@@ -96,14 +96,10 @@ def serial_query(domain, masters):
 def accept_notification():
     content = request.get_json()
     if not content:
-        return Response(
-            jsonify({'error' : 'no json in payload (maybe you forgot to set the content-type)'}),
-            status=400,
-            mimetype='application/json'
-        )
- 
+        msg = 'no json in payload (maybe you forgot to set the content-type)'
+        return jsonify({'error' : msg}), 400
     logging.info(content)
-    return jsonify({'msg' : 'gracias amigo!'})
+    return jsonify({'msg' : 'gracias amigo!'}), 202
 
 if __name__ == '__main__':
     logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
