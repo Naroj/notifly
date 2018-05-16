@@ -37,20 +37,18 @@ class Event(td.Thread):
     Handle a single event non-blocking
     """
 
-    def __init__(self, **kwargs):
+    def __init__(self, domain):
         super(Event, self).__init__()
-        self.config = kwargs['config']
-        self.domain = kwargs['domain']
+        self.domain = domain
 
     def run(self):
-        time.sleep(random.choice((1, 2, 3)))
         self.invoke_endpoints()
 
     def invoke_endpoints(self):
         """
         Invoke endpoints from configuration
         """
-        for name, conf  in self.config['endpoints'].items():
+        for name, conf  in CONF['endpoints'].items():
             logging.info("invoking endpoint: {}".format(name))
             try:
                 url = conf['url']
@@ -64,7 +62,12 @@ class Event(td.Thread):
             except KeyError:
                 headers = {}
             payload = json.dumps({'domain' : self.domain})
-            req = requests.put(url, headers=headers, data=payload)
+            try:
+                req = requests.put(url, headers=headers, data=payload)
+            except Exception as endpoint_error:
+                logging.error(
+                    "call on endpoint {} returned {}".format(name, endpoint_error)
+                )
             json_data = req.json()
             logging.info(json_data)
 
@@ -77,26 +80,16 @@ class EventReceiver(mp.Process):
 
     daemon = True
 
-    def __init__(self, config):
-        super(EventReceiver, self).__init__()
-        self.config = config
-
     def run(self):
-        """
-        run a daemonized consumer
-        consumer will drop events in our queue
-        """
         while True:
-            time.sleep(random.choice((2, 1)))
+            time.sleep(random.choice((1, 3, 2)))
             qsize = EVENT_QUEUE.qsize()
             for num in range(0, qsize):
                 event = EVENT_QUEUE.get()
                 event_thread = Event(
-                    config=self.config,
                     domain=event[1]
                 )
                 event_thread.start()
-                #self.event_handler(event)
             logging.info('{} has naptime'.format(os.getpid()))
 
 
@@ -157,11 +150,16 @@ class AsyncUDP(asyncio.DatagramProtocol):
         this method is called on each incoming UDP packet
         """
         request = self.unpack_from_wire(data)
-        source_ip = addr[0]
+        try:
+            source_ip = addr[0]
+        except KeyError:
+            logging.error('incomplete packet received, no src IP found')
+            return()
         if request is None:
+            logging.error('no data received')
             return()
         if request.opcode_text == 'NOTIFY':
-            logging.info(dir(request.request))
+            logging.info('got a notification')
             for opt in request.request.options:
                 logging.info(opt.data)
             if request.origin[-1] == '.':
@@ -169,7 +167,6 @@ class AsyncUDP(asyncio.DatagramProtocol):
             else:
                 EVENT_QUEUE.put((source_ip, request.origin))
             self.transport.sendto(data, addr)
-            logging.info('notification')
         else:
             try:
                 self.health_check(request, addr)
@@ -186,11 +183,6 @@ class UDPListener(mp.Process):
 
     daemon = True
 
-    def __init__(self, address='127.0.0.1', port=5500):
-        super(UDPListener, self).__init__()
-        self.address = address
-        self.port = port
-
     def run(self):
         """
         process entry method
@@ -200,7 +192,7 @@ class UDPListener(mp.Process):
         asyncio.set_event_loop(loop)
         endpoint = loop.create_datagram_endpoint(
             AsyncUDP,
-            local_addr=(self.address, int(self.port))
+            local_addr=(CONF['local_ip'], int(CONF['local_port']))
         )
         server = loop.run_until_complete(endpoint)
         try:
@@ -210,33 +202,6 @@ class UDPListener(mp.Process):
         server.close()
         loop.run_until_complete(server.wait_closed())
         loop.close()
-
-
-def parameter_parser():
-    """ parse CLI parameters """
-    parser = argparse.ArgumentParser(
-        description='Programmable DNS notification daemon (c) jfranx@kernelbug.org'
-    )
-    parser.add_argument(
-        '--local-ip',
-        required=False,
-        default='127.0.0.1',
-        help='IP address to listen on'
-    )
-    parser.add_argument(
-        '--local-port',
-        required=False,
-        default=0,
-        help='Port on which we receive DNS notifications (RFC1996)'
-    )
-    parser.add_argument(
-        '--conf',
-        required=False,
-        default=None,
-        help='parse config for endpoint invocation'
-    )
-    parsed_args = parser.parse_args(sys.argv[1:])
-    return parsed_args
 
 
 def proc_manager(**kwargs):
@@ -274,7 +239,39 @@ def proc_manager(**kwargs):
             new_instance.start()
             runtime.append(tuple((proc_name, new_instance)))
 
-def load_config(config):
+def parameter_parser():
+    """ parse CLI parameters """
+    parser = argparse.ArgumentParser(
+        description='Programmable DNS notification daemon (c) jfranx@kernelbug.org'
+    )
+    parser.add_argument(
+        '--local-ip',
+        required=False,
+        default='127.0.0.1',
+        help='IP address to listen on'
+    )
+    parser.add_argument(
+        '--local-port',
+        required=False,
+        default=0,
+        help='Port on which we receive DNS notifications (RFC1996)'
+    )
+    parser.add_argument(
+        '--workers',
+        required=False,
+        default=2,
+        help='Parallel workers to spread the load'
+    )
+    parser.add_argument(
+        '--conf',
+        required=False,
+        default=None,
+        help='parse config for endpoint invocation'
+    )
+    parsed_args = parser.parse_args(sys.argv[1:])
+    return parsed_args
+
+def parse_config_file(config):
     """
     Load config file (primarily for endpoints)
     """
@@ -297,6 +294,48 @@ def load_config(config):
         sys.exit(1)
     return content
 
+def load_config():
+    """
+    Parse config file and load parameters from CLI
+    the config file is always leading
+    """
+    params = parameter_parser()
+    if params.conf:
+        conf_file = parse_config_file(params.conf)
+    try:
+        local_ip = conf_file['net']['local_ip']
+    except KeyError:
+        local_ip = None
+    try:
+        local_port = conf_file['net']['local_port']
+    except KeyError:
+        local_port = None
+    try:
+        accept_from = conf_file['net']['accept_from']
+    except KeyError:
+        accept_from = None
+    try:
+        endpoints = conf_file['endpoints']
+    except KeyError:
+        endpoints = None
+    try:
+        workers = conf_file['workers']
+    except KeyError:
+        workers = None
+    if not local_ip:
+        local_ip = params.local_ip
+    if not local_port:
+        local_port = params.local_port
+    if not workers:
+        workers = params.workers
+    return {
+        'local_port' : local_port,
+        'local_ip' : local_ip,
+        'accept_from' : accept_from,
+        'workers' : workers,
+        'endpoints' : endpoints
+    }
+
 if __name__ == '__main__':
     """
     Get settings from CLI arguments
@@ -305,36 +344,25 @@ if __name__ == '__main__':
     """
     logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
     EVENT_QUEUE = mp.Queue()
-    PARAMS = parameter_parser()
-    if PARAMS.conf:
-        CONFIG = load_config(PARAMS.conf)
-    else:
-        CONFIG = None
+    CONF = load_config()
+    logging.info("starting server {}:{}"\
+    .format(CONF['local_ip'], CONF['local_port']))
+    WORKER_CLASSES = {}
+    for num in range(0, int(CONF['workers'])):
+        WORKER_CLASSES.update({num : EventReceiver})
+    logging.info("starting {} workers".format(CONF['workers']))
     NS_CLASSES = {
         'udp' : UDPListener
     }
-    NS_PROPERTIES = {
-        'address' : PARAMS.local_ip,
-        'port' : int(PARAMS.local_port)
-    }
     NS_RUNTIME = []
-    EVENT_CLASSES = {
-        'recv0' : EventReceiver,
-        'recv1' : EventReceiver
-    }
-    EVENT_PROPERTIES = {
-        'config' : CONFIG
-    }
-    EVENT_RUNTIME = []
+    WORKER_RUNTIME = []
     while True:
-        time.sleep(1)
         proc_manager(**{
             'classes' : NS_CLASSES,
-            'properties': NS_PROPERTIES,
             'runtime' : NS_RUNTIME
         })
         proc_manager(**{
-            'classes' : EVENT_CLASSES,
-            'properties' : EVENT_PROPERTIES,
-            'runtime' : EVENT_RUNTIME
+            'classes' : WORKER_CLASSES,
+            'runtime' : WORKER_RUNTIME
         })
+        time.sleep(3)
