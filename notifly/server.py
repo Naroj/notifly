@@ -49,7 +49,7 @@ class Event(td.Thread):
         Invoke endpoints from configuration
         """
         for name, conf  in CONF['endpoints'].items():
-            logging.info("invoking endpoint: {}".format(name))
+            #logging.info("invoking endpoint: {}".format(name))
             try:
                 url = conf['url']
             except KeyError:
@@ -64,12 +64,14 @@ class Event(td.Thread):
             payload = json.dumps({'domain' : self.domain})
             try:
                 req = requests.put(url, headers=headers, data=payload)
+                json_data = req.json()
+                logging.debug(json_data)
             except Exception as endpoint_error:
                 logging.error(
-                    "call on endpoint {} returned {}".format(name, endpoint_error)
+                    "endpoint {} errors: {}".format(name, endpoint_error)
                 )
-            json_data = req.json()
-            logging.info(json_data)
+            # TODO explicit logging of endpoint responses
+            #      perform checks on returned output
 
 
 class EventReceiver(mp.Process):
@@ -81,16 +83,26 @@ class EventReceiver(mp.Process):
     daemon = True
 
     def run(self):
+        # TODO find out if event queue provides an iterator
+        #      add limit on events to process
         while True:
             time.sleep(random.choice((1, 3, 2)))
             qsize = EVENT_QUEUE.qsize()
-            for num in range(0, qsize):
+            if qsize > CONF['event_batch_size']:
+                run_length = CONF['event_batch_size']
+            else:
+                run_length = qsize
+            if run_length:
+                logging.info("event queue contains {} items, processing {}"\
+                .format(qsize, run_length))
+            else:
+                logging.info('{} has naptime'.format(os.getpid()))
+            for num in range(0, run_length):
                 event = EVENT_QUEUE.get()
                 event_thread = Event(
                     domain=event[1]
                 )
                 event_thread.start()
-            logging.info('{} has naptime'.format(os.getpid()))
 
 
 class AsyncUDP(asyncio.DatagramProtocol):
@@ -103,13 +115,16 @@ class AsyncUDP(asyncio.DatagramProtocol):
     """
 
     def connection_made(self, transport):
+        """ called from asyncio module """
         self.transport = transport
 
     def health_check(self, request, addr):
         """
+        keeps DNSDIST happy
         Forward query to system resolvers (upstream)
         send resolver answer downstream
         (override response id with query id in order to satisfy client)
+        #TODO: tell more about health checks from DNSDIST
         """
         res = dns.resolver.Resolver(configure=True)
         health_query = res.query(request.origin, request.rdtype)
@@ -124,7 +139,9 @@ class AsyncUDP(asyncio.DatagramProtocol):
         """
         payload = dns.message.from_wire(data)
         if not payload.question:
+            # TODO log invalid packet
             return
+        # TODO tell more about purpose
         request = collections.namedtuple(
             'Request', [
                 'request',
@@ -147,26 +164,28 @@ class AsyncUDP(asyncio.DatagramProtocol):
 
     def datagram_received(self, data, addr):
         """
-        this method is called on each incoming UDP packet
+        this method is called on each incoming UDP packet by asyncio module
+        #TODO: explain origin correction 
         """
         request = self.unpack_from_wire(data)
         try:
             source_ip = addr[0]
         except KeyError:
             logging.error('incomplete packet received, no src IP found')
-            return()
+            return
         if request is None:
             logging.error('no data received')
-            return()
+            return
         if request.opcode_text == 'NOTIFY':
-            logging.info('got a notification')
-            for opt in request.request.options:
-                logging.info(opt.data)
+            #TODO: add origin in log
+            #      origin value check
+            #logging.info('got a notification')
             if request.origin[-1] == '.':
                 EVENT_QUEUE.put((source_ip, request.origin[:-1]))
             else:
                 EVENT_QUEUE.put((source_ip, request.origin))
             self.transport.sendto(data, addr)
+        # TODO: explicit DNSDIST health query check
         else:
             try:
                 self.health_check(request, addr)
@@ -257,6 +276,12 @@ def parameter_parser():
         help='Port on which we receive DNS notifications (RFC1996)'
     )
     parser.add_argument(
+        '--event-batch-size',
+        required=False,
+        default=100,
+        help='Port on which we receive DNS notifications (RFC1996)'
+    )
+    parser.add_argument(
         '--workers',
         required=False,
         default=2,
@@ -294,7 +319,7 @@ def parse_config_file(config):
         sys.exit(1)
     return content
 
-def load_config():
+def load_config(config_file=None):
     """
     Parse config file and load parameters from CLI
     the config file is always leading
@@ -302,6 +327,9 @@ def load_config():
     params = parameter_parser()
     if params.conf:
         conf_file = parse_config_file(params.conf)
+    else:
+        if config_file:
+            conf_file = parse_config_file(config_file)
     try:
         local_ip = conf_file['net']['local_ip']
     except KeyError:
@@ -319,6 +347,10 @@ def load_config():
     except KeyError:
         endpoints = None
     try:
+        event_batch_size = conf_file['general']['event_batch_size']
+    except KeyError:
+        event_batch_size = None
+    try:
         workers = conf_file['workers']
     except KeyError:
         workers = None
@@ -328,11 +360,14 @@ def load_config():
         local_port = params.local_port
     if not workers:
         workers = params.workers
+    if not event_batch_size:
+        event_batch_size = params.event_batch_size
     return {
         'local_port' : local_port,
         'local_ip' : local_ip,
         'accept_from' : accept_from,
         'workers' : workers,
+        'event_batch_size' : event_batch_size,
         'endpoints' : endpoints
     }
 
@@ -342,7 +377,7 @@ if __name__ == '__main__':
     TODO: add yaml config support
     Start proc managers
     """
-    logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
+    logging.basicConfig(stream=sys.stdout, level=logging.INFO)
     EVENT_QUEUE = mp.Queue()
     CONF = load_config()
     logging.info("starting server {}:{}"\

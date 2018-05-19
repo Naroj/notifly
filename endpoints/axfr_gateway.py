@@ -16,32 +16,25 @@ axfr_gw_app = Flask(__name__)
 """
 TODO: Make this a fully functional endpoint
 """
-
-"""
-def get_masters(domain):
-    try:
-        base_url = self.config['endpoints']['pdns']['url']
-        url = "{}/get_masters/{}".format(base_url, self.domain)
-    except KeyError:
+def get_masters(domain, remote_api, remote_api_key):
+    """
+    Get masters from a domain
+    """
+    url = "{}/api/v1/servers/localhost/zones/{}".format(remote_api, domain)
+    headers = {'X-API-Key' : remote_api_key}
+    payload = {'server_id':'localhost', 'zone_id' : domain}
+    req = requests.get(url, headers=headers)
+    data = req.json()
+    if 'error' in data.keys():
+        logging.error(data['error'])
         return []
     try:
-        headers = {}
-        for header in self.config['endpoints']['pdns']['headers']:
-            headers.update(header)
+        return data['masters']
     except KeyError:
-        headers = {}
-    try:
-        req = requests.get(url, headers=headers)
-        json_data = req.json()
-    except Exception as api_call_error: 
-        logging.error("error {} while fetching masters from {}"\
-        .format(api_call_error, self.domain))
         return []
-    if json_data:
-        logging.info("masters found for {} ({})".format(self.domain, json_data))
-        return json_data
     return []
 
+"""
 
 def filter_axfr(axfr_query):
     filtered_rrsets = []
@@ -82,15 +75,28 @@ def axfr_query(domain, masters):
         break
 """
 
-def serial_query(domain, masters):
+def serial_query(domain, nameservers):
     """
     Get serial from one of the DNS masters
     """
     request = dns.message.make_query(domain, dns.rdatatype.SOA)
-    for master in masters:
-        logging.info("asking master: " + master)
-        req = dns.query.udp(request, domain)
-        break
+    for ns in nameservers:
+        logging.info("asking nameserver: " + ns)
+        try:
+            req = dns.query.udp(request, ns)
+            break
+        except Exception as query_error:
+            req = None
+            logging.warning("nameserver threw an error: {}".format(query_error))
+    if not req:
+        logging.error("no nameserver returned a serial")
+        return False
+    try:
+        ns_serial = int(req.answer[0].to_text().split()[-5:][0])
+        return ns_serial
+    except:
+        logging.error("got invalid SOA record: {}".format(req.answer))
+        return False
 
 @axfr_gw_app.route('/', methods=['PUT'])
 def accept_notification():
@@ -98,8 +104,19 @@ def accept_notification():
     if not content:
         msg = 'no json in payload (maybe you forgot to set the content-type)'
         return jsonify({'error' : msg}), 400
-    logging.info(content)
-    return jsonify({'msg' : 'gracias amigo!'}), 202
+    remote_api = request.headers.get('remote_api'),
+    remote_api_key = request.headers.get('remote_api_key')
+    masters = get_masters(
+        content['domain'], 
+        remote_api[0], 
+        remote_api_key
+    )
+    slaves = ['185.3.211.53']
+    master_serial = serial_query(content['domain'], masters)
+    slave_serial = serial_query(content['domain'], slaves)
+    if master_serial > slave_serial:
+        perform_transfer()
+    return jsonify({'msg' : masters}), 202
 
 if __name__ == '__main__':
     logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
