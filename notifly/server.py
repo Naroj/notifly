@@ -30,6 +30,9 @@ import dns.rdatatype
 import dns.rdataclass
 import dns.resolver
 
+class ConfigError(Exception): pass
+class NoqQueueError(Exception): pass
+
 class EventQueueMonitor(td.Thread):
 
     """
@@ -41,17 +44,20 @@ class EventQueueMonitor(td.Thread):
     def run(self):
         while True:
             time.sleep(3)
-            logging.info("event queue size: %s", EVENT_QUEUE.qsize()) 
+            if EVENT_QUEUE.qsize():
+                logging.info("event queue size: %s", EVENT_QUEUE.qsize()) 
+
 
 class Event(td.Thread):
 
     """
-    Handle a single event non-blocking
+    Handle a single event
     """
 
-    def __init__(self, domain):
+    def __init__(self, domain, query_id):
         super(Event, self).__init__()
         self.domain = domain
+        self.query_id = query_id
 
     def run(self):
         self.invoke_endpoints()
@@ -73,16 +79,23 @@ class Event(td.Thread):
                     headers.update(header)
             except KeyError:
                 headers = {}
-            payload = json.dumps({'domain' : self.domain})
+            payload = json.dumps({
+                'id' : self.query_id,
+                'domain' : self.domain
+            })
             try:
                 req = requests.put(url, headers=headers, data=payload)
                 json_data = req.json()
                 logging.debug(json_data)
-                #EVENT_QUEUE.put(('127.0.0.1', self.domain))
             except Exception as endpoint_error:
                 logging.error(
                     "endpoint {} errors: {}".format(name, endpoint_error)
                 )
+                EVENT_QUEUE.put((
+                    '127.0.0.1', 
+                    self.domain, 
+                    self.query_id
+                ))
             # TODO explicit logging of endpoint responses
             #      perform checks on returned output
 
@@ -91,37 +104,47 @@ class EventReceiver(mp.Process):
 
     """
     Receive events and initiate an 'Event' class
+    The batch size setting determines how many concurrent, 
+    backend calls are executed on each cycle
     """
 
     daemon = True
 
     def run(self):
-        # TODO find out if event queue provides an iterator
-        #      add limit on events to process
+        """
+        """
         while True:
             time.sleep(random.choice((1, 3, 2)))
-            qsize = EVENT_QUEUE.qsize()
-            if qsize > CONF['event_batch_size']:
-                run_length = CONF['event_batch_size']
-            else:
-                run_length = qsize
-            if run_length:
-                logging.info("event queue contains {} items, processing {}"\
-                .format(qsize, run_length))
-            else:
-                logging.info('{} has naptime'.format(os.getpid()))
-            threads = []
-            for event in iter(EVENT_QUEUE.get, None):
-                run_length -= 1
-                if not run_length:
-                    logging.info("event limit reached %s items left", EVENT_QUEUE,qsize())
-                    break
-                event_thread = Event(
-                    domain=event[1]
-                )
-                threads.append(event_thread)
-                event_thread.start()
-                event_thread.join()
+            self.receiver()
+
+    def receiver(self):
+        """
+        process incoming events
+        """
+        qsize = EVENT_QUEUE.qsize()
+        if qsize > CONF['event_batch_size']:
+            run_length = CONF['event_batch_size']
+        else:
+            run_length = qsize
+        if run_length:
+            logging.info("event queue contains {} items, processing {}"\
+            .format(qsize, run_length))
+        else:
+            logging.info('{} has naptime'.format(os.getpid()))
+        threads = []
+        for event in iter(EVENT_QUEUE.get, None):
+            run_length -= 1
+            if not run_length:
+                logging.info("event limit reached %s items left", EVENT_QUEUE.qsize())
+                break
+            event_thread = Event(
+                domain=event[1],
+                query_id=event[2]
+            )
+            logging.info("event: %s", event)
+            threads.append(event_thread)
+            event_thread.start()
+            event_thread.join()
 
 
 class AsyncUDP(asyncio.DatagramProtocol):
@@ -134,9 +157,9 @@ class AsyncUDP(asyncio.DatagramProtocol):
     if event_queue is given to our contructor we use that (meant for tests)
     """
 
-    def __init__(self, event_queue=None):
-        self.event_queue = event_queue
+    def __init__(self, is_test=False):
         super(AsyncUDP, self).__init__()
+        self.is_test = is_test
 
     def connection_made(self, transport):
         """ called from asyncio module """
@@ -160,9 +183,6 @@ class AsyncUDP(asyncio.DatagramProtocol):
         return a request object with meaningful aspects from DNS packet
         """
         payload = dns.message.from_wire(data)
-        if not payload.question:
-            logging.error("dropping packet without question section")
-            return None
         request = collections.namedtuple(
             'Request', [
                 'request',
@@ -173,52 +193,73 @@ class AsyncUDP(asyncio.DatagramProtocol):
                 'opcode_text'
             ]
         )
-        request_data = request(
-            request=payload,
-            query_id=payload.id,
-            rdtype=payload.question[0].rdtype,
-            origin=payload.question[0].name.to_text(),
-            opcode_int=dns.opcode.from_flags(payload.flags),
-            opcode_text=dns.opcode.to_text(dns.opcode.from_flags(payload.flags))
-        )
-        return request_data
+        try:
+            return request(
+                request=payload,
+                query_id=payload.id,
+                rdtype=payload.question[0].rdtype,
+                origin=payload.question[0].name.to_text(),
+                opcode_int=dns.opcode.from_flags(payload.flags),
+                opcode_text=dns.opcode.to_text(
+                    dns.opcode.from_flags(payload.flags)
+                )
+            )
+        except KeyError:
+            logging.error("dropping invalid packet")
+            return None
+        logging.error("dropping packet with unknown issue")
+        return None
 
-    def handle_request(self, request, addr, is_test):
+    def handle_request(self, request, addr):
         """
         Take a parsed request (from self.unpack_from_wire)
         Perform checks on content and either process a NOTIFY or pass it to self.health_check
         trailling dots from origins are always removed
-        when is_test (boolean) is True we won't send a UDP response but return binary response instead
+        when self.is_test (boolean) is True we won't send a UDP response but return binary response instead
         """
         if request is None:
             logging.error('no data received')
             return
+        try:
+            if isinstance(EVENT_QUEUE, mp.queues.Queue):
+                event_queue = EVENT_QUEUE
+        except NameError:
+            if self.is_test:
+                event_queue = mp.Queue()
+            else:
+                raise NoqQueueError("EVENT_QUEUE is not declared")
+        logging.debug("test_mode: %s", str(self.is_test))
+        if request.origin[-1] == '.':
+            origin = request.origin[:-1]
+        else:
+            origin = request.origin
         if request.opcode_text == 'NOTIFY':
-            if request.origin[-1] == '.':
-                origin = request.origin[:-1]
-            else:
-                origin = request.origin
-            #logging.info("notify for %s", origin)
-            if not self.event_queue:
-                EVENT_QUEUE.put((addr[0], origin))
-            else:
-                self.event_queue.put((addr[0], origin))
+            logging.info("notify for %s", origin)
+            event_queue.put((
+                addr[0], 
+                origin, 
+                request.query_id
+            ))
             response = dns.message.make_response(request.request)
             response.flags |= dns.flags.AA
             wire = response.to_wire(response)
-            if is_test:
-                return wire
-            self.transport.sendto(wire, addr)
+            if not self.is_test:
+                self.transport.sendto(wire, addr)
+            else:
+                self.event_queue = event_queue
+                return event_queue
         # TODO: explicit DNSDIST health query check
         else:
-            if is_test:
-                return False
-            try:
-                self.health_check(request, addr)
-            except Exception as health_err:
-                logging.info("health-check error: {}".format(health_err))
+            if not self.is_test:
+                try:
+                    self.health_check(request, addr)
+                except Exception as health_err:
+                    logging.error("health-check error: {}".format(health_err))
+            else:
+                event_queue.put((addr[0], origin, request.query_id))
+                return event_queue
 
-    def datagram_received(self, data, addr, is_test=False):
+    def datagram_received(self, data, addr):
         """
         this method is called on each incoming UDP packet by asyncio module
         """
@@ -233,7 +274,7 @@ class AsyncUDP(asyncio.DatagramProtocol):
             logging.error('incomplete packet received, no src port found')
             return
         request = self.unpack_from_wire(data)
-        self.handle_request(request, addr, is_test)
+        self.handle_request(request, addr)
 
 
 class UDPListener(mp.Process):
@@ -254,7 +295,10 @@ class UDPListener(mp.Process):
         asyncio.set_event_loop(loop)
         endpoint = loop.create_datagram_endpoint(
             AsyncUDP,
-            local_addr=(CONF['local_ip'], int(CONF['local_port']))
+            local_addr=(
+                CONF['local_ip'], 
+                CONF['local_port']
+            )
         )
         server = loop.run_until_complete(endpoint)
         try:
@@ -293,9 +337,9 @@ def proc_manager(**kwargs):
             runtime.append(tuple((proc_name, proc_instance)))
     for unix_proc in runtime:
         proc_name = unix_proc[0]
-        proc_inst = unix_proc[1]
-        if not proc_inst.is_alive():
-            logging.info('proc {} died, new instance is on the rise %s' % proc_inst)
+        proc_instance = unix_proc[1]
+        if not proc_instance.is_alive():
+            logging.info('proc {} died, new instance is on the rise %s' % proc_instance)
             runtime.remove(unix_proc)
             new_instance = classes[proc_name](**properties)
             new_instance.start()
@@ -378,9 +422,11 @@ def load_config(config_file=None):
     except KeyError:
         local_ip = None
     try:
-        local_port = conf_file['net']['local_port']
+        local_port = int(conf_file['net']['local_port'])
     except KeyError:
         local_port = None
+    except ValueError:
+        raise ConfigError("local_port is not a number")
     try:
         accept_from = conf_file['net']['accept_from']
     except KeyError:
@@ -390,19 +436,29 @@ def load_config(config_file=None):
     except KeyError:
         endpoints = None
     try:
-        event_batch_size = conf_file['general']['event_batch_size']
+        event_batch_size = int(conf_file['general']['event_batch_size'])
     except KeyError:
         event_batch_size = None
+    except ValueError:
+        raise ConfigError("event_batch_size must be a number")
     try:
-        workers = conf_file['workers']
+        workers = int(conf_file['general']['workers'])
+    except ValueError:
+        raise ConfigError("workers must be a number")
     except KeyError:
         workers = None
     if not local_ip:
         local_ip = params.local_ip
     if not local_port:
-        local_port = params.local_port
+        try:
+            local_port = int(params.local_port)
+        except ValueError:
+            raise ConfigError("local_port must be a number")
     if not workers:
-        workers = params.workers
+        try:
+            workers = int(params.workers)
+        except ValueError:
+            raise ConfigError("workers must be a number")
     if not event_batch_size:
         event_batch_size = params.event_batch_size
     return {
@@ -422,7 +478,12 @@ if __name__ == '__main__':
     """
     logging.basicConfig(stream=sys.stdout, level=logging.INFO)
     EVENT_QUEUE = mp.Queue()
-    CONF = load_config()
+    try:
+        logging.info("parsing config")     
+        CONF = load_config()
+    except ConfigError as config_err:
+        logging.error("config parse failure: %s", config_err)
+        sys.exit(1)
     logging.info("starting server %s:%s",\
     CONF['local_ip'], CONF['local_port'])
     WORKER_CLASSES = {}

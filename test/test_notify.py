@@ -8,7 +8,6 @@ import sys
 import os
 import tempfile
 import logging
-import queue
 import random
 
 import dns.name
@@ -71,28 +70,41 @@ class TestNotifyHandling(unittest.TestCase):
         if not item[1] == self.domain:
             self.fail("unexpected domain returned: %s", item[1])
 
+    def test_lack_of_notify_opcode(self):
+        """
+        Test if the result queue items have expected values in content
+        """
+        logging.info("notify queue content test without notification opcode")
+        event_queue = conduct_notify(self.domain, self.addr, notify_opcode=False)
+        item = event_queue.get()
+        logging.info(type(event_queue))
+        return
+        logging.info("received item: %s", item)
+        if not item[0] == self.addr[0]:
+            self.fail("unexpected source address returned: %s", item[0])
+        if not item[1] == self.domain:
+            self.fail("unexpected domain returned: %s", item[1])
 
-def conduct_notify(domain, addr):
+
+
+def conduct_notify(domain, addr, notify_opcode=True):
     """ 
     Conduct DNS NOTIFY object and event queue based on function input
     The result can be fetched from the returned queue object
+    Notification opcode can be switched off to test behavior of this scenario
     """
-    Q = queue.Queue()
     notify = dns.message.make_query(domain, dns.rdatatype.SOA)
-    notify.set_opcode(dns.opcode.NOTIFY)
+    if notify_opcode:
+        notify.set_opcode(dns.opcode.NOTIFY)
     logging.debug("sending '%s' to parser", notify.question)
     wire = notify.to_wire()
-    udp_server = server.AsyncUDP(
-        event_queue=Q
-    )
+    udp_server = server.AsyncUDP(is_test=True)
     request = udp_server.unpack_from_wire(wire)
-    answer = udp_server.handle_request(
+    event_queue = udp_server.handle_request(
         request,
-        addr=addr,
-        is_test=True
+        addr=addr
     )
-    return Q
-
+    return event_queue
 
 
 if __name__ == '__main__':
