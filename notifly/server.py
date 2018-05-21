@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 
+"""
+Asynchronous TCP/UDP DNS service
+Listens for DNS notifications and calls backend as configured
+(c) jfranx@kernelbug.org
+"""
+
 import os
 import sys
 import asyncio
@@ -10,7 +16,6 @@ import time
 import random
 import threading as td
 import multiprocessing as mp
-import pprint
 import json
 
 import requests
@@ -25,11 +30,18 @@ import dns.rdatatype
 import dns.rdataclass
 import dns.resolver
 
-"""
-Asynchronous TCP/UDP DNS service
-Listens for DNS notifications and calls backend as configured
-(c) jfranx@kernelbug.org
-"""
+class EventQueueMonitor(td.Thread):
+
+    """
+    Report event queue size via logging module
+    """
+
+    deamon = True
+
+    def run(self):
+        while True:
+            time.sleep(3)
+            logging.info("event queue size: %s", EVENT_QUEUE.qsize()) 
 
 class Event(td.Thread):
 
@@ -66,6 +78,7 @@ class Event(td.Thread):
                 req = requests.put(url, headers=headers, data=payload)
                 json_data = req.json()
                 logging.debug(json_data)
+                #EVENT_QUEUE.put(('127.0.0.1', self.domain))
             except Exception as endpoint_error:
                 logging.error(
                     "endpoint {} errors: {}".format(name, endpoint_error)
@@ -97,12 +110,18 @@ class EventReceiver(mp.Process):
                 .format(qsize, run_length))
             else:
                 logging.info('{} has naptime'.format(os.getpid()))
-            for num in range(0, run_length):
-                event = EVENT_QUEUE.get()
+            threads = []
+            for event in iter(EVENT_QUEUE.get, None):
+                run_length -= 1
+                if not run_length:
+                    logging.info("event limit reached %s items left", EVENT_QUEUE,qsize())
+                    break
                 event_thread = Event(
                     domain=event[1]
                 )
+                threads.append(event_thread)
                 event_thread.start()
+                event_thread.join()
 
 
 class AsyncUDP(asyncio.DatagramProtocol):
@@ -112,7 +131,12 @@ class AsyncUDP(asyncio.DatagramProtocol):
     we process binary payload
     relevant elements in a queue
     event listener classes will take notice and perform content-level operations
+    if event_queue is given to our contructor we use that (meant for tests)
     """
+
+    def __init__(self, event_queue=None):
+        self.event_queue = event_queue
+        super(AsyncUDP, self).__init__()
 
     def connection_made(self, transport):
         """ called from asyncio module """
@@ -123,8 +147,6 @@ class AsyncUDP(asyncio.DatagramProtocol):
         keeps DNSDIST happy
         Forward query to system resolvers (upstream)
         send resolver answer downstream
-        (override response id with query id in order to satisfy client)
-        #TODO: tell more about health checks from DNSDIST
         """
         res = dns.resolver.Resolver(configure=True)
         health_query = res.query(request.origin, request.rdtype)
@@ -135,13 +157,12 @@ class AsyncUDP(asyncio.DatagramProtocol):
     def unpack_from_wire(self, data):
         """
         Parse binary payload from wire
-        return a shiny object with relevant aspects
+        return a request object with meaningful aspects from DNS packet
         """
         payload = dns.message.from_wire(data)
         if not payload.question:
-            # TODO log invalid packet
-            return
-        # TODO tell more about purpose
+            logging.error("dropping packet without question section")
+            return None
         request = collections.namedtuple(
             'Request', [
                 'request',
@@ -162,35 +183,57 @@ class AsyncUDP(asyncio.DatagramProtocol):
         )
         return request_data
 
-    def datagram_received(self, data, addr):
+    def handle_request(self, request, addr, is_test):
+        """
+        Take a parsed request (from self.unpack_from_wire)
+        Perform checks on content and either process a NOTIFY or pass it to self.health_check
+        trailling dots from origins are always removed
+        when is_test (boolean) is True we won't send a UDP response but return binary response instead
+        """
+        if request is None:
+            logging.error('no data received')
+            return
+        if request.opcode_text == 'NOTIFY':
+            if request.origin[-1] == '.':
+                origin = request.origin[:-1]
+            else:
+                origin = request.origin
+            #logging.info("notify for %s", origin)
+            if not self.event_queue:
+                EVENT_QUEUE.put((addr[0], origin))
+            else:
+                self.event_queue.put((addr[0], origin))
+            response = dns.message.make_response(request.request)
+            response.flags |= dns.flags.AA
+            wire = response.to_wire(response)
+            if is_test:
+                return wire
+            self.transport.sendto(wire, addr)
+        # TODO: explicit DNSDIST health query check
+        else:
+            if is_test:
+                return False
+            try:
+                self.health_check(request, addr)
+            except Exception as health_err:
+                logging.info("health-check error: {}".format(health_err))
+
+    def datagram_received(self, data, addr, is_test=False):
         """
         this method is called on each incoming UDP packet by asyncio module
-        #TODO: explain origin correction 
         """
-        request = self.unpack_from_wire(data)
         try:
             source_ip = addr[0]
         except KeyError:
             logging.error('incomplete packet received, no src IP found')
             return
-        if request is None:
-            logging.error('no data received')
+        try:
+            addr[1]
+        except KeyError:
+            logging.error('incomplete packet received, no src port found')
             return
-        if request.opcode_text == 'NOTIFY':
-            #TODO: add origin in log
-            #      origin value check
-            #logging.info('got a notification')
-            if request.origin[-1] == '.':
-                EVENT_QUEUE.put((source_ip, request.origin[:-1]))
-            else:
-                EVENT_QUEUE.put((source_ip, request.origin))
-            self.transport.sendto(data, addr)
-        # TODO: explicit DNSDIST health query check
-        else:
-            try:
-                self.health_check(request, addr)
-            except Exception as health_err:
-                logging.info("health-check error: {}".format(health_err))
+        request = self.unpack_from_wire(data)
+        self.handle_request(request, addr, is_test)
 
 
 class UDPListener(mp.Process):
@@ -303,17 +346,17 @@ def parse_config_file(config):
     fail = False
     with open(config, 'r') as fp:
         content = yaml.load(fp.read())
-    if not 'endpoints' in content.keys():
+    if 'endpoints' not in content.keys():
         return
     for title, items in content['endpoints'].items():
         if not 'url' in items.keys():
             fail = True
-            logging.error("no url found in endpoint '{}'".format(title))
+            logging.error("no url found in endpoint '%s'", title)
         if not items['url'].startswith('http'):
             fail = True
-            logging.error("non HTTP(S) url found in endoint '{}'".format(title))
+            logging.error("non HTTP(S) url found in endoint '%s'", title)
         if not items['url'].startswith('https'):
-            logging.warning("non SSL url found in endoint '{}'".format(title))
+            logging.warning("non SSL url found in endoint '%s'", title)
     if fail:
         logging.info("stopping execution due to blocking config issues")
         sys.exit(1)
@@ -373,15 +416,15 @@ def load_config(config_file=None):
 
 if __name__ == '__main__':
     """
-    Get settings from CLI arguments
-    TODO: add yaml config support
+    Get settings from CLI arguments and config
+    Start event queue monitor
     Start proc managers
     """
     logging.basicConfig(stream=sys.stdout, level=logging.INFO)
     EVENT_QUEUE = mp.Queue()
     CONF = load_config()
-    logging.info("starting server {}:{}"\
-    .format(CONF['local_ip'], CONF['local_port']))
+    logging.info("starting server %s:%s",\
+    CONF['local_ip'], CONF['local_port'])
     WORKER_CLASSES = {}
     for num in range(0, int(CONF['workers'])):
         WORKER_CLASSES.update({num : EventReceiver})
@@ -391,6 +434,8 @@ if __name__ == '__main__':
     }
     NS_RUNTIME = []
     WORKER_RUNTIME = []
+    event_monitor = EventQueueMonitor()
+    event_monitor.start()
     while True:
         proc_manager(**{
             'classes' : NS_CLASSES,
@@ -400,4 +445,4 @@ if __name__ == '__main__':
             'classes' : WORKER_CLASSES,
             'runtime' : WORKER_RUNTIME
         })
-        time.sleep(3)
+        time.sleep(10)

@@ -1,10 +1,14 @@
+"""
+Config test module
+Check wether config parser return expected output based on input
+"""
+
 import unittest
 import sys
 import os
 import tempfile
 import logging
 from notifly import server
-
 
 MOCK_CONFIG_NO_DEFAULTS = """
 endpoints:
@@ -67,7 +71,7 @@ class TestConfigParser(unittest.TestCase):
 
     def setUp(self):
         logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
-        logging.debug("setting up test")
+        logging.debug("setting up config test")
 
     def tearDown(self):
         logging.debug("ending test")
