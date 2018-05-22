@@ -49,18 +49,45 @@ endpoints:
       - remote_api: "http://185.3.211.53:8081"
       - remote_api_key: "api_Iu2ooyuoSee5zeihee5doeNgohPhir0f"
     url: "http://127.0.0.1:1026"
-  #axfr_gateway:
-  #  headers:
-  #    - content-type: "application/json"
-  #    - remote_api: "http://185.3.211.53:8081"
-  #    - remote_api_key: "api_Iu2ooyuoSee5zeihee5doeNgohPhir0f"
-  #  url: "http://127.0.0.1:1027"
-  #mailer: 
-  #  headers: 
-  #    - from_email: "corn@soup.nl"
-  #    - to_email: "bucket+lol@kernelbug.org"
-  #    - subject: "zone update"
-  #  url: "http://127.0.0.1:1025"
+"""
+
+MOCK_CONFIG_IMPOSSIBLE_PORT = """
+endpoints:
+  pdns:
+    headers:
+      - check_masters: "true"
+      - remote_api: "http://185.3.211.53:8081"
+      - remote_api_key: "api_Iu2ooyuoSee5zeihee5doeNgohPhir0f"
+    url: "http://127.0.0.1:1026"
+
+net:
+  local_port: "no int"
+"""
+
+MOCK_CONFIG_IMPOSSIBLE_BATCH_SIZE = """
+endpoints:
+  pdns:
+    headers:
+      - check_masters: "true"
+      - remote_api: "http://185.3.211.53:8081"
+      - remote_api_key: "api_Iu2ooyuoSee5zeihee5doeNgohPhir0f"
+    url: "http://127.0.0.1:1026"
+
+general:
+  event_batch_size: "no int"
+"""
+
+MOCK_CONFIG_IMPOSSIBLE_WORKERS = """
+endpoints:
+  pdns:
+    headers:
+      - check_masters: "true"
+      - remote_api: "http://185.3.211.53:8081"
+      - remote_api_key: "api_Iu2ooyuoSee5zeihee5doeNgohPhir0f"
+    url: "http://127.0.0.1:1026"
+
+general:
+  workers: "no int"
 """
 
 class TestConfigParser(unittest.TestCase):
@@ -96,6 +123,27 @@ class TestConfigParser(unittest.TestCase):
         self.assertTrue(config['local_port'] == 0)
         self.assertTrue(config['event_batch_size'] == 100)
         self.assertTrue(config['workers'] == 2)
+
+    def test_config_fails(self):
+        """
+        Our config parser should raise a 'ConfigError' if 
+        """
+        try:
+            config = parser(MOCK_CONFIG_IMPOSSIBLE_PORT)
+            self.fail("wrong local_port value does not result in ConfigError")
+        except server.ConfigError:
+            pass
+        try:
+            config = parser(MOCK_CONFIG_IMPOSSIBLE_BATCH_SIZE)
+            self.fail("wrong batch_size value does not result in ConfigError")
+        except server.ConfigError:
+            pass
+        try:
+            config = parser(MOCK_CONFIG_IMPOSSIBLE_WORKERS)
+            self.fail("wrong worker value does not result in ConfigError")
+        except server.ConfigError:
+            pass
+
 
 def parser(config_as_string):
     """
